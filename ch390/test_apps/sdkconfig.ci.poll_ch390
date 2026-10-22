@@ -1,2 +1,0 @@
-# Set to polling mode
-CONFIG_ETHERNET_SPI_INT0_GPIO=-1

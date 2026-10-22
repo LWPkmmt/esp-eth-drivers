@@ -22,13 +22,21 @@
 
 #define CH390_INFO_MODEL                     0x01
 
-// CH390DS1 v1.8, Table 9-7-2: RSTB must be low for at least 1 ms.
-#define CH390_RESET_ASSERTION_TIME_US         1000
-// CH390DS1 v1.8, Table 9-7-2, Note 3 recommends 4 ms before host access after RSTB reset.
-#define CH390_POST_RESET_DELAY_MS             4
+#define CH390_PHY_BMCR_REG              0x00
+#define CH390_PHY_ANER_REG              0x06
+#define CH390_PHY_VENDOR_STATUS_REG     0x10
+#define CH390_PHY_PN_CTRL_REG           0x1B
+#define CH390_PHY_PAGE_SEL_REG          0x1F
+
+#define CH390_PHY_BMCR_AN_ENABLE        (1U << 12)
+#define CH390_PHY_BMCR_SPEED_100        (1U << 13)
+
+#define CH390_PHY_PN_STATUS_BIT         (1U << 12)
+#define CH390_PHY_PN_TRIGGER_BIT        (1U << 15)
 
 typedef struct {
     phy_802_3_t phy_802_3;
+    uint8_t pn_check_step;
 } phy_ch390_t;
 
 static const char *TAG = "ch390.phy";
@@ -81,12 +89,91 @@ err:
     return ret;
 }
 
+static esp_err_t ch390_phy_check_pn(phy_ch390_t *ch390, bool force_10m)
+{
+    phy_802_3_t *phy_802_3 = &ch390->phy_802_3;
+    esp_eth_mediator_t *eth = phy_802_3->eth;
+    uint32_t reg10 = 0;
+    uint32_t aner = 0;
+    uint32_t reg1b = 0;
+    esp_err_t ret;
+    ret = eth->phy_reg_write(eth,phy_802_3->addr, CH390_PHY_PAGE_SEL_REG,0);
+    if (ret != ESP_OK) {
+        ch390->pn_check_step = 0;
+        return ret;
+    }
+    ret = eth->phy_reg_read(eth,phy_802_3->addr, CH390_PHY_VENDOR_STATUS_REG, &reg10);
+    if (ret != ESP_OK) {
+        ch390->pn_check_step = 0;
+        return ret;
+    }
+    if ((reg10 & CH390_PHY_PN_STATUS_BIT) == 0) {
+        ch390->pn_check_step = 0;
+        return ESP_OK;
+    }
+    if (ch390->pn_check_step == 0) {
+        ch390->pn_check_step = 1;
+        // ESP_LOGW(TAG,"PN first detect, reg10=0x%04" PRIx32,reg10);
+        return ESP_OK;
+    }
+    ch390->pn_check_step = 0;
+    if (!force_10m) {
+        ret = eth->phy_reg_read(eth,phy_802_3->addr,CH390_PHY_ANER_REG, &aner);
+        if (ret != ESP_OK) {
+            return ret;
+        }
+        if (aner & 0x01U) {
+            // ESP_LOGW(TAG,"PN recovery skipped, reg10=0x%04" PRIx32", ANER=0x%04" PRIx32,reg10,aner);
+            return ESP_OK;
+        }
+    }
+    ret = eth->phy_reg_read(eth,phy_802_3->addr,CH390_PHY_PN_CTRL_REG, &reg1b);
+    if (ret != ESP_OK) {
+        return ret;
+    }
+    uint32_t old_reg1b = reg1b;
+    reg1b |= CH390_PHY_PN_TRIGGER_BIT;
+    ret = eth->phy_reg_write(eth,phy_802_3->addr,CH390_PHY_PN_CTRL_REG,reg1b);
+    if (ret != ESP_OK) {
+        return ret;
+    }
+    // ESP_LOGW(TAG,"CH390 PHY PN recovery triggered: ""reg10=0x%04" PRIx32", ANER=0x%04" PRIx32", reg1B=0x%04" PRIx32"->0x%04" PRIx32,reg10,aner,old_reg1b,reg1b);
+    return ESP_OK;
+}
+
 static esp_err_t ch390_get_link(esp_eth_phy_t *phy)
 {
     esp_err_t ret = ESP_OK;
     phy_ch390_t *ch390 = __containerof(esp_eth_phy_into_phy_802_3(phy), phy_ch390_t, phy_802_3);
     /* Update information about link, speed, duplex */
     ESP_GOTO_ON_ERROR(ch390_update_link_duplex_speed(ch390), err, TAG, "update link duplex speed failed");
+    if (ch390->phy_802_3.link_status == ETH_LINK_UP) {
+        ch390->pn_check_step = 0;
+        return ESP_OK;
+    }
+    esp_eth_mediator_t *eth = ch390->phy_802_3.eth;
+    uint32_t bmcr = 0;
+    ret = eth->phy_reg_write(eth,ch390->phy_802_3.addr,CH390_PHY_PAGE_SEL_REG,0);
+
+    if (ret != ESP_OK) {
+        goto err;
+    }
+    ret = eth->phy_reg_read(eth,ch390->phy_802_3.addr,CH390_PHY_BMCR_REG, &bmcr);
+    if (ret != ESP_OK) {
+        goto err;
+    }
+    esp_err_t pn_ret = ESP_OK;
+    if (bmcr & CH390_PHY_BMCR_AN_ENABLE) {
+        pn_ret = ch390_phy_check_pn(ch390,false);
+    } else if ((bmcr & CH390_PHY_BMCR_SPEED_100) == 0) {
+        pn_ret = ch390_phy_check_pn(ch390,true);
+    } else {
+        ch390->pn_check_step = 0;
+    }
+    if (pn_ret != ESP_OK) {
+        ch390->pn_check_step = 0;
+        ESP_LOGW(TAG,"CH390 PHY PN check failed: %s", esp_err_to_name(pn_ret));
+    }
     return ESP_OK;
 err:
     return ret;
@@ -144,15 +231,7 @@ esp_eth_phy_t *esp_eth_phy_new_ch390(const eth_phy_config_t *config)
     esp_eth_phy_t *ret = NULL;
     phy_ch390_t *ch390 = calloc(1, sizeof(phy_ch390_t));
     ESP_GOTO_ON_FALSE(ch390, NULL, err, TAG, "calloc ch390 failed");
-    ESP_GOTO_ON_FALSE(config, NULL, err, TAG, "can't set phy config to null");
-    eth_phy_config_t ch390_config = *config;
-    if (ch390_config.hw_reset_assert_time_us == 0) {
-        ch390_config.hw_reset_assert_time_us = CH390_RESET_ASSERTION_TIME_US;
-    }
-    if (ch390_config.post_hw_reset_delay_ms == 0) {
-        ch390_config.post_hw_reset_delay_ms = CH390_POST_RESET_DELAY_MS;
-    }
-    ESP_GOTO_ON_FALSE(esp_eth_phy_802_3_obj_config_init(&ch390->phy_802_3, &ch390_config) == ESP_OK,
+    ESP_GOTO_ON_FALSE(esp_eth_phy_802_3_obj_config_init(&ch390->phy_802_3, config) == ESP_OK,
                       NULL, err, TAG, "configuration initialization of PHY 802.3 failed");
 
     // override functions which need to be customized for sake of ch390
